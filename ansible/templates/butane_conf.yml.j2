@@ -123,9 +123,7 @@ storage:
           ## System Packages
           if [ ! -f "/var/.stage-one-complete" ]; then
             rpm-ostree ex module enable cri-o:$K8S_VERSION
-            rpm-ostree install conntrack
-            rpm-ostree install cri-o
-            rpm-ostree install ethtool
+            rpm-ostree install conntrack cri-o ethtool --idempotent --allow-inactive
             touch /var/.stage-one-complete
             systemctl reboot
           fi
