@@ -1,0 +1,56 @@
+---
+- name: Removes a cluster from the AI Service and Libvirt/KVM
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: yes
+
+  vars:
+    delete_generated_assets: true
+
+  tasks:
+    - name: Read in variables
+      include_vars:
+        dir: vars
+        extensions:
+          - 'yaml'
+          - 'yml'
+          
+    - name: Delete the VMs in Libvirt
+      block:
+      - name: Destroy all the VMs
+        community.libvirt.virt:
+          name: "{{ item.name }}"
+          state: destroyed
+        loop: "{{ cluster_nodes }}"
+        loop_control:
+          label: "Destroying {{ item.name }}"
+        ignore_errors: yes
+
+      - name: Delete all the VMs
+        community.libvirt.virt:
+          name: "{{ item.name }}"
+          command: undefine
+        loop: "{{ cluster_nodes }}"
+        loop_control:
+          label: "Deleting {{ item.name }}"
+        ignore_errors: yes
+
+      - name: Delete the VM Disks
+        include_tasks: tasks/libvirt_delete_disks.yaml
+        loop: "{{ cluster_nodes }}"
+        loop_control:
+          loop_var: node
+
+      - name: Reattach devices to host system from VMs
+        include_tasks: tasks/libvirt_reattach_devices.yaml
+        loop: "{{ cluster_nodes }}"
+        loop_control:
+          loop_var: node
+        when: node.pci_devices is defined
+
+    - name: Delete the generated content directory
+      file:
+        state: absent
+        path: "{{ generated_asset_directory }}/{{ cluster_name }}.{{ cluster_domain }}/"
+      when: delete_generated_assets|bool

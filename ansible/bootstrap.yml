@@ -1,0 +1,288 @@
+---
+- name: Create Kuberentes cluster on Fedora CoreOS on Libvirt/KVM
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Read in variables
+      include_vars:
+        dir: vars
+        extensions:
+          - 'yaml'
+          - 'yml'
+
+################################################################################
+## Preflight
+    - name: Preflight Checks - Create directory
+      file:
+        path: "{{ generated_asset_directory }}/{{ cluster_name }}.{{ cluster_domain }}"
+        state: directory
+        mode: 0755
+
+    - name: Preflight Checks - Create Libvirt Images directory
+      file:
+        path: "{{ libvirt_base_vm_path }}"
+        state: directory
+        mode: 0755
+ 
+################################################################################
+## FCOS Downloading
+
+    - name: Stat for the FCOS Image
+      find:
+        path: "{{ libvirt_base_vm_path }}"
+        patterns: 'fedora-coreos*.qcow2'
+        recurse: no
+      register: fcos_image_stat
+
+    - name: Download FCOS Image
+      containers.podman.podman_container:
+        name: "coreos-installer-{{ node_item.name }}"
+        image: quay.io/coreos/coreos-installer:release
+        state: started
+        rm: yes
+        interactive: yes
+        volume: 
+          - "{{ libvirt_base_vm_path }}:/data"
+        workdir: /data
+        command: "download -s {{ fcos_stream }} --architecture x86_64 -p qemu -f qcow2.xz --decompress"
+      become: yes
+      when: fcos_image_stat.matched == 0
+
+    - name: Get the FCOS Image
+      find:
+        path: "{{ libvirt_base_vm_path }}"
+        patterns: 'fedora-coreos*.qcow2'
+        recurse: no
+      register: fcos_image_target
+
+################################################################################
+## Templating
+
+    - name: Template Node Butane Configs
+      template:
+        src: templates/butane_conf.yml.j2
+        dest: "{{ generated_asset_directory }}/{{ cluster_name }}.{{ cluster_domain }}/butane-{{ node_item.name }}.yml"
+      loop: "{{ cluster_nodes }}"
+      loop_control:
+        loop_var: node_item
+
+    - name: Get absolute path to the asset directory
+      shell: pwd
+      args:
+        chdir: "{{ generated_asset_directory }}"
+      register: asset_directory
+
+    - name: Convert Node Butane Configs to Ignition Configs
+      containers.podman.podman_container:
+        name: "butane-{{ node_item.name }}"
+        image: quay.io/coreos/butane:release
+        state: started
+        interactive: yes
+        detach: yes
+        rm: yes
+        security_opt:
+          - label=disable
+        volume:
+        - "{{ asset_directory.stdout }}/{{ cluster_name }}.{{ cluster_domain }}:/pwd"
+        workdir: /pwd
+        command: |
+          --pretty --strict ./butane-{{ node_item.name }}.yml -o ./ignition-{{ node_item.name }}.ign
+      loop: "{{ cluster_nodes }}"
+      loop_control:
+        loop_var: node_item
+      become: yes
+
+    - name: Stat for the Ignition files
+      find:
+        path: "{{ asset_directory.stdout }}/{{ cluster_name }}.{{ cluster_domain }}"
+        patterns: '*.ign'
+        recurse: no
+      register: ignition_files
+      become: yes
+
+    - name: Set permissions on Ignition files
+      file:
+        path: "{{ file_item.path }}"
+        mode: 0755
+        owner: "{{ local_ansible_user }}"
+        group: "{{ local_ansible_user }}"
+      loop: "{{ ignition_files.files }}"
+      loop_control:
+        loop_var: file_item
+      become: yes
+
+################################################################################
+## VM Creation
+
+    - name: Get the list of currently available VMs
+      shell: virsh list --all --name
+      become: yes
+      register: libvirt_vms_list
+
+    - name: Create VMs via virt-install
+      shell: |
+        virt-install --connect="qemu:///system" --name="{{ node_item.name }}" \
+        --vcpus "sockets={{ node_item.vm.cpu_sockets }},cores={{ node_item.vm.cpu_cores }},threads={{ node_item.vm.cpu_threads }}" \
+        --memory="{{ node_item.vm.memory }}" \
+        --os-variant="fedora-coreos-{{ fcos_stream }}" --import \
+        {{ libvirt_like_options }} \
+        --disk="size={{ node_item.vm.disks[0].size }},backing_store={{ fcos_image_target.files[0].path }}" \
+        --qemu-commandline="-fw_cfg name=opt/com.coreos/config,file={{ asset_directory.stdout }}/{{ cluster_name }}.{{ cluster_domain }}/ignition-{{ node_item.name }}.ign"
+      loop: "{{ cluster_nodes }}"
+      loop_control:
+        loop_var: node_item
+        label: "{{ node_item.name }}"
+      when: node_item.name not in libvirt_vms_list.stdout_lines
+      become: yes
+
+    - name: Add the hosts to the inventory
+      add_host:
+        name: "{{ node_item.name }}"
+        hostname: "{{ node_item.network.ip_address }}"
+        ansible_user: core
+        ansible_connection: ssh
+        ansible_python_interpreter: "/usr/bin/python"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i {{ core_user_ssh_private_key_path }}'
+        groups:
+        - fck8s
+        - "fck8s_{{ node_item.type }}"
+      loop: "{{ cluster_nodes }}"
+      loop_control:
+        loop_var: node_item
+        label: "{{ node_item.name }}"
+
+- name: Global Node Configuration
+  hosts: fck8s
+  gather_facts: no
+  become: yes
+
+  tasks:
+
+    - name: Wait for SSH to come up
+      wait_for_connection:
+        delay: 1
+        connect_timeout: 5
+        sleep: 20
+        timeout: 600
+
+    - name: Read in variables
+      include_vars:
+        dir: vars
+        extensions:
+          - 'yaml'
+          - 'yml'
+
+    - name: Create the needed directories
+      file:
+        state: directory
+        path: "{{ dir_item.path }}"
+        owner: root
+        group: root
+        mode: 0755
+      loop:
+        - path: /var/bin
+        - path: /etc/systemd/system/kubelet.service.d
+        - path: /var/lib/kubelet
+        - path: /etc/kubernetes
+        - path: /var/libexec/kubernetes/kubelet-plugins/volume/exec/
+      loop_control:
+        loop_var: dir_item
+
+    - name: Look for crictl
+      ansible.builtin.stat:
+        path: /var/run/crictl
+      register: crictl_stat
+
+    - name: Look for kubectl
+      ansible.builtin.stat:
+        path: /var/run/kubectl
+      register: kubectl_stat
+
+    - name: Download crictl if not found
+      ansible.builtin.unarchive:
+        src: "https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ crictl_version }}/crictl-{{ crictl_version }}-Linux-amd64.tar.gz"
+        dest: "/var/bin"
+        remote_src: yes
+      when: crictl_stat.stat.exists == False
+
+    - name: Download kubernetes binaries if not found
+      ansible.builtin.get_url:
+        url: "https://dl.k8s.io/release/v{{ k8s_version }}.0/bin/linux/amd64/{{ binary_item }}"
+        dest: "/var/bin"
+        remote_src: yes
+        mode: 0755
+      when: kubectl_stat.stat.exists == False
+      loop:
+        - kubectl
+        - kubeadm
+        - kubelet
+      loop_control:
+        loop_var: binary_item
+
+    - name: Check for cri-o
+      ansible.builtin.stat:
+        path: /usr/bin/crio
+      register: crio_stat
+
+    - name: Check for conntrack
+      ansible.builtin.stat:
+        path: /usr/sbin/conntrack
+      register: conntrack_stat
+
+    - name: Check for ethtool
+      ansible.builtin.stat:
+        path: /usr/sbin/ethtool
+      register: ethtool_stat
+
+    - name: Enable rpm module
+      shell: "rpm-ostree ex module enable cri-o:{{ k8s_version }}"
+      ignore_errors: yes
+      when: crio_stat.stat.exists == False
+
+    - name: Install needed packages - cri-o
+      community.general.rpm_ostree_pkg:
+        name: cri-o
+        state: present
+      when: crio_stat.stat.exists == False
+      register: crio_pkg_install
+
+    - name: Install needed packages - conntrack
+      community.general.rpm_ostree_pkg:
+        name: conntrack
+        state: present
+      when: conntrack_stat.stat.exists == False
+      register: conntrack_pkg_install
+
+    - name: Install needed packages - ethtool
+      community.general.rpm_ostree_pkg:
+        name: ethtool
+        state: present
+      when: ethtool_stat.stat.exists == False
+      register: ethtool_pkg_install
+
+    - name: Template SystemD Service - Kubelet
+      template:
+        src: templates/kubelet.service.j2
+        dest: /etc/systemd/system/kubelet.service
+    
+    - name: Template SystemD Service Config - Kubelet Kubeadm Conf
+      template:
+        src: templates/10-kubeadm.conf.j2
+        dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+
+    - name: Reload SystemD Services
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and Start Kubelet
+      ansible.builtin.systemd:
+        state: started
+        name: kubelet
+        enabled: true
+
+    - name: Reboot
+      reboot:
+        pre_reboot_delay: 0
+      when: crio_pkg_install.changed or conntrack_pkg_install.changed or ethtool_pkg_install.changed

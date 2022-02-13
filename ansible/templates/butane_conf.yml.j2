@@ -1,0 +1,203 @@
+variant: fcos
+version: 1.4.0
+systemd:
+  units:
+    - name: docker.service
+      mask: true
+    - name: docker.socket
+      mask: true
+    - name: fck8s-setup.service
+      enabled: false
+      contents: |-
+        [Unit]
+        Description=fck8s-setup: Fedora CoreOS Kuberentes Setup
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        ExecStart=/etc/fck8s_setup.sh
+        Type=simple
+        Restart=on-failure
+
+        [Install]
+        WantedBy=multi-user.target
+    - name: python-setup.service
+      enabled: true
+      contents: |-
+        [Unit]
+        Description=python-setup: Fedora CoreOS Python Setup
+        Wants=network-online.target
+        After=network-online.target
+
+        [Service]
+        ExecStart=/etc/python_setup.sh
+        Type=simple
+        Restart=on-failure
+
+        [Install]
+        WantedBy=multi-user.target
+
+passwd:
+  users:
+    - name: core
+      groups:
+        - wheel
+        - sudo
+      ssh_authorized_keys:
+{% for key in core_user_ssh_authorized_keys %}
+        - {{ key }}
+{% endfor %}
+storage:
+  files:
+    - path: /etc/python_setup.sh
+      mode: 0755
+      contents:
+        inline: |
+          #!/bin/bash
+
+          set -e
+
+          if [ ! -f "/var/.python-install-complete" ]; then
+            sleep 10
+            rpm-ostree install python libselinux-python3 --idempotent --allow-inactive
+            touch /var/.python-install-complete
+            systemctl reboot
+          fi
+
+    - path: /etc/fck8s_setup.sh
+      mode: 0755
+      contents:
+        inline: |
+          #!/bin/bash
+
+          set -e
+          if [ ! -f "/var/.stage-one-complete" ]; then
+            sleep 10
+          fi
+
+          DOWNLOAD_DIR=/var/bin
+          CRICTL_VERSION="v1.23.0"
+          CNI_VERSION="v1.0.1"
+          K8S_VERSION="1.22"
+          SERVICE_RELEASE_VERSION="v0.12.0"
+
+          mkdir -p $DOWNLOAD_DIR
+          mkdir -p /var/cni/bin
+          mkdir -p /etc/systemd/system/kubelet.service.d
+          mkdir -p /var/lib/kubelet
+          mkdir -p /etc/kubernetes
+          mkdir -p /var/libexec/kubernetes/kubelet-plugins/volume/exec/
+
+          ## Download Crictl
+          if [ ! -f "${DOWNLOAD_DIR}/crictl" ]; then
+            curl -L "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-Linux-amd64.tar.gz" | tar -C $DOWNLOAD_DIR -xz
+          fi
+
+          ### Download CNI
+          #if [ ! -f "/var/cni/bin/host-local" ]; then
+          #  curl -L "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-Linux-amd64-${CNI_VERSION}.tgz" | tar -C /var/cni/bin -xz
+          #fi
+
+          ## Download K8s binaries
+          if [ ! -f "${DOWNLOAD_DIR}/kubeadm" ]; then
+            cd $DOWNLOAD_DIR
+            curl -L --remote-name-all https://dl.k8s.io/release/v${K8S_VERSION}.0/bin/linux/amd64/{kubeadm,kubelet,kubectl}
+            chmod a+x {kubeadm,kubelet,kubectl}
+          fi
+
+          ## Setup SystemD Services
+          if [ ! -f "/etc/systemd/system/kubelet.service" ]; then
+            curl -sSL "https://raw.githubusercontent.com/kubernetes/release/${SERVICE_RELEASE_VERSION}/cmd/kubepkg/templates/latest/rpm/kubelet/kubelet.service" | sed "s:/usr/bin:${DOWNLOAD_DIR}:g" | tee /etc/systemd/system/kubelet.service
+          fi
+
+          if [ ! -f "/etc/systemd/system/kubelet.service.d/10-kubeadm.conf" ]; then
+            curl -sSL "https://raw.githubusercontent.com/kubernetes/release/${SERVICE_RELEASE_VERSION}/cmd/kubepkg/templates/latest/rpm/kubeadm/10-kubeadm.conf" | sed "s:/usr/bin:${DOWNLOAD_DIR}:g" | tee /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+          fi
+
+          set +e
+          systemctl daemon-reload
+          if [ "$(systemctl is-enabled kubelet)" != "enabled" ]; then
+            systemctl enable kubelet
+          fi
+
+          ## System Packages
+          if [ ! -f "/var/.stage-one-complete" ]; then
+            rpm-ostree ex module enable cri-o:$K8S_VERSION
+            rpm-ostree install conntrack
+            rpm-ostree install cri-o
+            rpm-ostree install ethtool
+            touch /var/.stage-one-complete
+            systemctl reboot
+          fi
+    - path: /etc/profile.d/bindir.sh
+      mode: 0644
+      contents:
+        inline: |
+          export PATH="/var/bin:$PATH"
+    - path: /etc/profile.d/systemd-pager.sh
+      mode: 0644
+      contents:
+        inline: |
+          # Tell systemd to not use a pager when printing information
+          export SYSTEMD_PAGER=cat
+    - path: /etc/sysctl.d/20-silence-audit.conf
+      mode: 0644
+      contents:
+        inline: |
+          # Raise console message logging level from DEBUG (7) to WARNING (4)
+          # to hide audit messages from the interactive console
+          kernel.printk=4
+    - path: /etc/modules-load.d/crio.conf
+      mode: 0644
+      contents:
+        inline: |
+          overlay
+          br_netfilter
+    - path: /etc/sysctl.d/99-kubernetes-cri.conf
+      mode: 0644
+      contents:
+        inline: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.ipv4.ip_forward                 = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+    - path: /etc/hostname
+      mode: 420
+      overwrite: true
+      contents:
+        source: "data:,{{ node_item.name }}"
+    - path: /etc/sysconfig/selinux
+      mode: 420
+      overwrite: true
+      contents:
+        inline: |
+          SELINUX=permissive
+          SELINUXTYPE=targeted
+    - path: /etc/NetworkManager/system-connections/bridge0.nmconnection
+      mode: 0600
+      overwrite: true
+      contents:
+        inline: |
+          [connection]
+          id=bridge0
+          type=bridge
+          interface-name=bridge0
+          [bridge]
+          [ipv4]
+          method=manual
+          addresses={{ node_item.network.ip_address }}/{{ node_item.network.cidr_prefix }}
+          gateway={{ node_item.network.gateway }}
+          dns={{ cluster_node_network_static_dns_servers | join(';') }}
+          dns-search={{ cluster_node_network_static_dns_search_domains | join(';') }}
+          may-fail=false
+    - path: /etc/NetworkManager/system-connections/bridge0-slave-enp1s0.nmconnection
+      mode: 0600
+      overwrite: true
+      contents:
+        inline: |
+          [connection]
+          id=bridge0-slave-enp1s0
+          type=ethernet
+          interface-name=enp1s0
+          master=bridge0
+          slave-type=bridge
+          [bridge-port]
