@@ -97,3 +97,6 @@ libvirt_base_vm_path: /var/lib/libvirt/images
 
 libvirt_host_bridge_iface: containerLANbr0
 libvirt_like_options: "--network bridge={{ libvirt_host_bridge_iface }},model=virtio -v --memballoon none --cpu host-passthrough --autostart --noautoconsole --virt-type kvm --features kvm_hidden=on --controller type=scsi,model=virtio-scsi --graphics vnc,listen=0.0.0.0,tlsport=-1,defaultMode='insecure'"
+
+################################################## Default K8s Options
+api_port: 6443

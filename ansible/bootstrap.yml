@@ -183,9 +183,12 @@
         mode: 0755
       loop:
         - path: /var/bin
+        - path: /var/lib/etcd
         - path: /etc/systemd/system/kubelet.service.d
         - path: /var/lib/kubelet
         - path: /etc/kubernetes
+        - path: /etc/kubernetes/manifests
+        - path: /etc/kubernetes/pki
         - path: /var/libexec/kubernetes/kubelet-plugins/volume/exec/
       loop_control:
         loop_var: dir_item
@@ -276,13 +279,45 @@
       ansible.builtin.systemd:
         daemon_reload: true
 
+    - name: Enable and Start CRI-O
+      ansible.builtin.systemd:
+        state: started
+        name: crio
+        enabled: true
+
     - name: Enable and Start Kubelet
       ansible.builtin.systemd:
         state: started
         name: kubelet
         enabled: true
 
+    #- name: Create registries.conf
+
     - name: Reboot
       reboot:
         pre_reboot_delay: 0
       when: crio_pkg_install.changed or conntrack_pkg_install.changed or ethtool_pkg_install.changed
+
+- name: First Control Plane Node Configuration
+  hosts: fck8s_controlPlane
+  gather_facts: no
+  become: yes
+
+  tasks:
+
+    - name: Wait for SSH to come up
+      wait_for_connection:
+        delay: 1
+        connect_timeout: 5
+        sleep: 20
+        timeout: 600
+
+    - name: Read in variables
+      include_vars:
+        dir: vars
+        extensions:
+          - 'yaml'
+          - 'yml'
+    
+    #- name: Template over the initial cluster configuration
+    #- name: Run kubeadm init
