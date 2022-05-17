@@ -6,6 +6,7 @@ systemd:
       mask: true
     - name: docker.socket
       mask: true
+
     - name: fck8s-setup.service
       enabled: false
       contents: |-
@@ -21,6 +22,7 @@ systemd:
 
         [Install]
         WantedBy=multi-user.target
+
     - name: python-setup.service
       enabled: true
       contents: |-
@@ -36,7 +38,27 @@ systemd:
 
         [Install]
         WantedBy=multi-user.target
-
+{% if groups['fck8s_controlPlane'][0] == node_item.name %}
+    - name: k8shaproxy.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Kubernetes Cluster HAProxy
+        After=network-online.target
+        Wants=network-online.target
+        [Service]
+        Type=forking
+        Restart=always
+        TimeoutSec=600
+        KillMode=process
+        RemainAfterExit=yes
+        ExecStartPre=/bin/bash -c '(while ! nc -z -v -w1 registry-1.docker.io 443 2>/dev/null; do echo "Waiting for network to come online..."; sleep 2; done); sleep 2; podman pull docker.io/library/haproxy:latest'
+        ExecStart=podman run -dt --name k8shaproxy --sysctl net.ipv4.ip_unprivileged_port_start=0 -p 80/tcp -p 443/tcp -p 6443/tcp --network lanBridge -v /etc/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg --ip {{ cluster_load_balancer_ip }} docker.io/library/haproxy:latest
+        ExecStop=podman stop -t 10 k8shaproxy
+        ExecStopPost=podman rm k8shaproxy
+        [Install]
+        WantedBy=multi-user.target
+{% endif %}
 passwd:
   users:
     - name: core
@@ -59,7 +81,7 @@ storage:
 
           if [ ! -f "/var/.python-install-complete" ]; then
             sleep 10
-            rpm-ostree install python libselinux-python3 --idempotent --allow-inactive
+            rpm-ostree install python libselinux-python3 nc --idempotent --allow-inactive
             touch /var/.python-install-complete
             systemctl reboot
           fi
@@ -127,17 +149,20 @@ storage:
             touch /var/.stage-one-complete
             systemctl reboot
           fi
+
     - path: /etc/profile.d/bindir.sh
       mode: 0644
       contents:
         inline: |
           export PATH="/var/bin:$PATH"
+
     - path: /etc/profile.d/systemd-pager.sh
       mode: 0644
       contents:
         inline: |
           # Tell systemd to not use a pager when printing information
           export SYSTEMD_PAGER=cat
+
     - path: /etc/sysctl.d/20-silence-audit.conf
       mode: 0644
       contents:
@@ -145,12 +170,14 @@ storage:
           # Raise console message logging level from DEBUG (7) to WARNING (4)
           # to hide audit messages from the interactive console
           kernel.printk=4
+
     - path: /etc/modules-load.d/crio.conf
       mode: 0644
       contents:
         inline: |
           overlay
           br_netfilter
+
     - path: /etc/sysctl.d/99-kubernetes-cri.conf
       mode: 0644
       contents:
@@ -158,11 +185,13 @@ storage:
           net.bridge.bridge-nf-call-iptables  = 1
           net.ipv4.ip_forward                 = 1
           net.bridge.bridge-nf-call-ip6tables = 1
+
     - path: /etc/hostname
       mode: 420
       overwrite: true
       contents:
         source: "data:,{{ node_item.name }}"
+
     - path: /etc/selinux/config
       mode: 420
       overwrite: true
@@ -170,6 +199,7 @@ storage:
         inline: |
           SELINUX=permissive
           SELINUXTYPE=targeted
+
     - path: /etc/NetworkManager/system-connections/bridge0.nmconnection
       mode: 0600
       overwrite: true
@@ -187,6 +217,7 @@ storage:
           dns={{ cluster_node_network_static_dns_servers | join(';') }}
           dns-search={{ cluster_node_network_static_dns_search_domains | join(';') }}
           may-fail=false
+
     - path: /etc/NetworkManager/system-connections/bridge0-slave-enp1s0.nmconnection
       mode: 0600
       overwrite: true
@@ -199,3 +230,124 @@ storage:
           master=bridge0
           slave-type=bridge
           [bridge-port]
+
+    - path: /etc/NetworkManager/conf.d/calico.conf
+      mode: 0600
+      overwrite: true
+      contents:
+        inline: |
+          [keyfile]
+          unmanaged-devices=interface-name:cali*;interface-name:tunl*;interface-name:vxlan.calico;interface-name:wireguard.cali
+
+{% if groups['fck8s_controlPlane'][0] == node_item.name %}
+    - path: /etc/haproxy.cfg
+      mode: 0644
+      overwrite: true
+      contents:
+        inline: |
+          global
+              log         127.0.0.1 local2
+              maxconn     4000
+
+              # turn on stats unix socket
+              stats socket /var/lib/haproxy/stats
+
+              # utilize system-wide crypto-policies
+              #ssl-default-bind-ciphers PROFILE=SYSTEM
+              #ssl-default-server-ciphers PROFILE=SYSTEM
+
+          defaults
+              mode                    tcp
+              log                     global
+              option                  tcplog
+              option                  dontlognull
+              option http-server-close
+              option                  redispatch
+              retries                 3
+              timeout http-request    10s
+              timeout queue           1m
+              timeout connect         10s
+              timeout client          1m
+              timeout server          1m
+              timeout http-keep-alive 10s
+              timeout check           10s
+              maxconn                 3000
+
+          frontend api
+              bind {{ cluster_load_balancer_ip }}:6443
+              default_backend controlplaneapi
+
+          frontend secure
+              bind {{ cluster_load_balancer_ip }}:443
+              default_backend secure
+
+          frontend insecure
+              bind {{ cluster_load_balancer_ip }}:80
+              default_backend insecure
+
+          backend controlplaneapi
+              balance source
+          {% for node in cluster_nodes %}{% if node.type == "controlPlane" %}
+              server {{ node.name }} {{ node.network.ip_address }}:6443 check
+          {% endif %}{% endfor %}
+
+          backend secure
+              balance source
+          {% for node in cluster_nodes %}{% if node.type == "applicationNode" %}
+              server {{ node.name }} {{ node.network.ip_address }}:443 check
+          {% endif %}{% endfor %}
+
+          backend insecure
+              balance source
+          {% for node in cluster_nodes %}{% if node.type == "applicationNode" %}
+              server {{ node.name }} {{ node.network.ip_address }}:80 check
+          {% endif %}{% endfor %}
+          #END OF HAPROXY CONFIG
+    - path: /etc/cni/net.d/69-lanBridge.conflist
+      mode: 0644
+      overwrite: true
+      contents:
+        inline: |
+          {
+            "cniVersion": "0.4.0",
+            "name": "lanBridge",
+            "plugins": [
+              {
+                "type": "bridge",
+                "bridge": "bridge0",
+                "ipam": {
+                  "type": "host-local",
+                  "ranges": [
+                    [
+                      {
+                        "subnet": "{{ bridgeSubnet }}",
+                        "rangeStart": "{{ bridgeRangeStart }}",
+                        "rangeEnd": "{{ bridgeRangeEnd }}",
+                        "gateway": "{{ bridgeGateway }}"
+                      }
+                    ]
+                  ],
+                  "routes": [
+                    {"dst": "0.0.0.0/0"}
+                  ]
+                }
+              },
+              {
+                "type": "portmap",
+                "capabilities": {
+                  "portMappings": true
+                }
+              },
+              {
+                "type": "firewall",
+                "backend": ""
+              },
+              {
+                "type": "tuning",
+                "capabilities": {
+                  "mac": true
+                }
+              }
+            ]
+          }
+{% endif %}

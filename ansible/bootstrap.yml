@@ -25,6 +25,22 @@
         path: "{{ libvirt_base_vm_path }}"
         state: directory
         mode: 0755
+
+    - name: Add the hosts to the inventory
+      add_host:
+        name: "{{ node_item.name }}"
+        hostname: "{{ node_item.network.ip_address }}"
+        ansible_user: core
+        ansible_connection: ssh
+        ansible_python_interpreter: "/usr/bin/python"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i {{ core_user_ssh_private_key_path }}'
+        groups:
+        - fck8s
+        - "fck8s_{{ node_item.type }}"
+      loop: "{{ cluster_nodes }}"
+      loop_control:
+        loop_var: node_item
+        label: "{{ node_item.name }}"
  
 ################################################################################
 ## FCOS Downloading
@@ -137,22 +153,6 @@
       when: node_item.name not in libvirt_vms_list.stdout_lines
       become: yes
 
-    - name: Add the hosts to the inventory
-      add_host:
-        name: "{{ node_item.name }}"
-        hostname: "{{ node_item.network.ip_address }}"
-        ansible_user: core
-        ansible_connection: ssh
-        ansible_python_interpreter: "/usr/bin/python"
-        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i {{ core_user_ssh_private_key_path }}'
-        groups:
-        - fck8s
-        - "fck8s_{{ node_item.type }}"
-      loop: "{{ cluster_nodes }}"
-      loop_control:
-        loop_var: node_item
-        label: "{{ node_item.name }}"
-
 - name: Global Node Configuration
   hosts: fck8s
   gather_facts: no
@@ -203,6 +203,11 @@
         path: /var/run/kubectl
       register: kubectl_stat
 
+    - name: Look for netcat
+      ansible.builtin.stat:
+        path: /usr/bin/nc
+      register: nc_stat
+
     - name: Download crictl if not found
       ansible.builtin.unarchive:
         src: "https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ crictl_version }}/crictl-{{ crictl_version }}-Linux-amd64.tar.gz"
@@ -212,7 +217,7 @@
 
     - name: Download kubernetes binaries if not found
       ansible.builtin.get_url:
-        url: "https://dl.k8s.io/release/v{{ k8s_version }}.0/bin/linux/amd64/{{ binary_item }}"
+        url: "https://dl.k8s.io/release/v{{ k8s_version_long }}/bin/linux/amd64/{{ binary_item }}"
         dest: "/var/bin"
         remote_src: yes
         mode: 0755
@@ -265,11 +270,18 @@
       when: ethtool_stat.stat.exists == False
       register: ethtool_pkg_install
 
+    - name: Install needed packages - nc
+      community.general.rpm_ostree_pkg:
+        name: nc
+        state: present
+      when: nc_stat.stat.exists == False
+      register: nc_pkg_install
+
     - name: Template SystemD Service - Kubelet
       template:
         src: templates/kubelet.service.j2
         dest: /etc/systemd/system/kubelet.service
-    
+
     - name: Template SystemD Service Config - Kubelet Kubeadm Conf
       template:
         src: templates/10-kubeadm.conf.j2
@@ -278,6 +290,24 @@
     - name: Reload SystemD Services
       ansible.builtin.systemd:
         daemon_reload: true
+
+    - name: Set sudoers path to include /var/bin
+      replace:
+        path: /etc/sudoers
+        replace: "Defaults    secure_path = /var/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/var/lib/snapd/snap/bin"
+        regexp: "^Defaults    secure_path = .*$"
+
+    - name: Reboot
+      reboot:
+        pre_reboot_delay: 0
+      when: crio_pkg_install.changed or nc_pkg_install.changed or conntrack_pkg_install.changed or ethtool_pkg_install.changed or nc_stat.stat.exists == False or crio_stat.stat.exists == False or conntrack_stat.stat.exists == False or ethtool_stat.stat.exists == False
+
+    - name: Wait for SSH to come up
+      wait_for_connection:
+        delay: 1
+        connect_timeout: 5
+        sleep: 20
+        timeout: 600
 
     - name: Enable and Start CRI-O
       ansible.builtin.systemd:
@@ -291,12 +321,8 @@
         name: kubelet
         enabled: true
 
-    #- name: Create registries.conf
-
-    - name: Reboot
-      reboot:
-        pre_reboot_delay: 0
-      when: crio_pkg_install.changed or conntrack_pkg_install.changed or ethtool_pkg_install.changed
+    - name: Prepull Kubernetes Images
+      shell: "/var/bin/kubeadm config images pull --kubernetes-version {{ k8s_version_long }}"
 
 - name: First Control Plane Node Configuration
   hosts: fck8s_controlPlane
@@ -318,6 +344,111 @@
         extensions:
           - 'yaml'
           - 'yml'
-    
-    #- name: Template over the initial cluster configuration
-    #- name: Run kubeadm init
+
+    - name: Get first control plane node
+      ansible.builtin.debug:
+        msg: "{{ groups['fck8s_controlPlane'][0] }}"
+
+    - name: Primary control plane operations
+      block:
+        - name: Template over the initial cluster configuration
+          template:
+            src: templates/initDefaultClusterConfig.yml
+            dest: /etc/kubernetes/initDefaultClusterConfig.yml
+
+#        - name: Template over the HAProxy configuration
+#          template:
+#            src: templates/haproxy.cfg.j2
+#            dest: /etc/haproxy.cfg
+
+        - name: Run kubeadm init
+          shell: |
+            /var/bin/kubeadm init --config /etc/kubernetes/initDefaultClusterConfig.yml --upload-certs > /etc/kubernetes/kubeadm-init.log
+          register: kubeadmin_init_r
+
+        - name: Debug
+          ansible.builtin.debug:
+            msg: "{{ kubeadmin_init_r.stdout_lines }}"
+
+        - name: Get kubeadm join command
+          set_fact: 
+            kubeadm_cp_join_index: "{{ lookup('ansible.utils.index_of', kubeadmin_init_r.stdout_lines, 'eq', 'You can now join any number of the control-plane node running the following command on each as root:') }}"
+            kubeadm_join_index: "{{ lookup('ansible.utils.index_of', kubeadmin_init_r.stdout_lines, 'eq', 'Then you can join any number of worker nodes by running the following on each as root:') }}"
+
+        - name: Set Facts for the join command
+          set_fact:
+            kubeadm_cp_join_command: "{{ kubeadmin_init_r.stdout_lines[kubeadm_cp_join_index + 2] }}"
+            kubeadm_join_command: "{{ kubeadmin_init_r.stdout_lines[kubeadm_join_index + 2] }}"
+
+        - name: Debug
+          ansible.builtin.debug:
+            msg: "{{ kubeadm_cp_join_command }}"
+
+        - name: Debug
+          ansible.builtin.debug:
+            msg: "{{ kubeadm_join_command }}"
+
+        - name: Download Calico Networking bits
+          ansible.builtin.get_url:
+            url: "{{ link_item }}"
+            dest: "/opt/{{ link_item | split('/') | last }}"
+            mode: '0664'
+          loop:
+            - https://projectcalico.docs.tigera.io/manifests/tigera-operator.yaml
+          loop_control:
+            loop_var: link_item
+
+        - name: Template the Calico Installation
+          template:
+            src: templates/calico-installation.yml.j2
+            dest: /opt/calico-installation.yml
+          
+        - name: Run the Tigera Operator Install
+          kubernetes.core.k8s:
+            state: present
+            src: /opt/tigera-operator.yaml
+
+        - name: Wait 5 seconds
+          ansible.builtin.pause:
+            seconds: 5
+          
+        - name: Run the Tigera Operator Install
+          kubernetes.core.k8s:
+            state: present
+            src: /opt/calico-installation.yml
+
+      when: groups['fck8s_controlPlane'][0] == inventory_hostname
+
+    - name: Secondary control plane operations
+      block:
+
+        - name: Join the kubernetes cluster
+          shell: |
+            {{ hostvars[groups['fck8s_controlPlane'][0]]['kubeadm_cp_join_command' }}
+
+      when: groups['fck8s_controlPlane'][0] != inventory_hostname
+
+- name: Application Node Configuration
+  hosts: fck8s_applicationNode
+  gather_facts: no
+  become: yes
+
+  tasks:
+
+    - name: Wait for SSH to come up
+      wait_for_connection:
+        delay: 1
+        connect_timeout: 5
+        sleep: 20
+        timeout: 600
+
+    - name: Read in variables
+      include_vars:
+        dir: vars
+        extensions:
+          - 'yaml'
+          - 'yml'
+
+    - name: Join the kubernetes cluster
+      shell: |
+        {{ hostvars[groups['fck8s_controlPlane'][0]]['kubeadm_join_command' }}
